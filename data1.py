@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from scipy.integrate import cumulative_trapezoid
-import math
 
 # オイラー角（roll, pitch, yaw）から回転行列を計算する関数
 def euler_to_rotation_matrix(roll, pitch, yaw):
@@ -26,8 +25,8 @@ def euler_to_rotation_matrix(roll, pitch, yaw):
 # メインの処理を行う関数
 def main():
     # CSVファイルからセンサーデータを読み込む
-    df = pd.read_csv("sensor_data50.csv")
-    
+    df = pd.read_csv("before_flight2.csv")
+
     # 'Time_s' カラムが存在すればその値を使用、なければ dt=0.01 秒でタイムスタンプを生成
     if 'Time_s' in df.columns:
         time = df['Time_s'].values
@@ -36,23 +35,18 @@ def main():
         dt = 0.01
         time = np.arange(len(df)) * dt
 
-    # 不要なカラムを除外する
-    columns_to_exclude = ['Lat', 'Lng', 'Alt_m', 'Fix', 'Sats']
-    data = df.drop(columns=columns_to_exclude, errors='ignore')
+    # 新しいCSVファイルに対応したカラム名を指定
+    acc_columns = ['AccelX_g', 'AccelY_g', 'AccelZ_g']
+    gyro_columns = ['GyroX_deg_s', 'GyroY_deg_s', 'GyroZ_deg_s']
     
-    # 加速度センサーおよびジャイロセンサーのカラム名を抽出
-    acc_columns = [col for col in data.columns if 'Acc' in col or 'acc' in col]
-    gyro_columns = [col for col in data.columns if 'Gyro' in col or 'gyro' in col]
+    # 必要なカラムが存在するかチェック
+    missing_columns = []
+    for col in acc_columns + gyro_columns:
+        if col not in df.columns:
+            missing_columns.append(col)
     
-    # 加速度センサー、ジャイロセンサーともに3軸のデータがあるかチェック
-    if len(acc_columns) < 3:
-        raise ValueError("加速度センサーのカラムが3つ以上ありません")
-    if len(gyro_columns) < 3:
-        raise ValueError("ジャイロセンサーのカラムが3つ以上ありません")
-    
-    # 先頭の3カラムを使用
-    acc_columns = acc_columns[:3]
-    gyro_columns = gyro_columns[:3]
+    if missing_columns:
+        raise ValueError(f"必要なカラムが見つかりません: {missing_columns}")
     
     # 加速度データを取得し、単位を g から m/s^2 に変換
     acc_data = data[acc_columns].to_numpy() * 9.81
@@ -102,7 +96,28 @@ def main():
         attitude[i] = attitude[i-1] + gyro_data_rad[i] * dt_array[i-1]
     
     N = len(time)
-    global_acc = np.zeros_like(acc_data)
+    attitude = np.zeros((N, 3))
+    attitude[0] = [initial_roll, initial_pitch, initial_yaw]
+    
+    # より正確な姿勢推定
+    for i in range(1, N):
+        # 前の姿勢角に角速度を積分して加算
+        attitude[i] = attitude[i-1] + gyro_data_rad[i] * dt
+    
+    # 加速度のローパスフィルタリング（ノイズ除去）
+    def low_pass_filter(data, alpha=0.8):
+        filtered = np.zeros_like(data)
+        filtered[0] = data[0]
+        for i in range(1, len(data)):
+            filtered[i] = alpha * filtered[i-1] + (1 - alpha) * data[i]
+        return filtered
+    
+    # 各軸の加速度にローパスフィルタを適用
+    acc_data_filtered = np.zeros_like(acc_data)
+    for axis in range(3):
+        acc_data_filtered[:, axis] = low_pass_filter(acc_data[:, axis])
+    
+    global_acc = np.zeros_like(acc_data_filtered)
     # 各時刻における加速度をグローバル座標系に変換
     for i in range(N):
         roll = attitude[i, 0]
@@ -119,8 +134,16 @@ def main():
     threshold = 1.0  # 1.0 m/s^2以下の加速度を0にする（より積極的）
     global_acc[np.abs(global_acc) < threshold] = 0
     
-    # 各時刻のグローバル加速度の大きさを計算（カラーグラデーションおよびホバーテキストの指標として利用）
-    acc_magnitude = np.linalg.norm(global_acc, axis=1)
+    # 静止時の加速度バイアスを除去
+    static_samples = min(20, len(global_acc))
+    bias = np.mean(global_acc[:static_samples], axis=0)
+    global_acc = global_acc - bias
+    
+    # 各時刻のグローバル加速度の大きさを計算
+    if 'TotalAccel' in df.columns:
+        acc_magnitude = df['TotalAccel'].to_numpy() * 9.81
+    else:
+        acc_magnitude = np.linalg.norm(global_acc, axis=1)
     
     # 実際の時間差を使って加速度の積分により速度、さらに速度の積分により位置を計算
     velocity = np.zeros_like(global_acc)
@@ -173,7 +196,14 @@ def main():
     axis_length = 1.0  # 局所座標軸の長さ（メートル）
     
     # 飛行軌跡のトレースを作成
-    # customdata と hovertemplate を設定して、カーソルオーバー時に加速度の値も表示する
+    custom_data = np.column_stack([
+        acc_magnitude,
+        df['Temperature_C'].to_numpy(),
+        df['Humidity_%'].to_numpy(),
+        df['Pressure_hPa'].to_numpy(),
+        time
+    ])
+    
     flight_path_trace = go.Scatter3d(
         x=position[:, 0],
         y=position[:, 1],
@@ -189,8 +219,16 @@ def main():
             )
         ),
         name='飛行軌跡',
-        customdata=acc_magnitude,
-        hovertemplate='加速度: %{customdata:.2f} m/s^2<br>X: %{x:.2f} m<br>Y: %{y:.2f} m<br>Z: %{z:.2f} m'
+        customdata=custom_data,
+        hovertemplate='<b>飛行データ</b><br>' +
+                      '時刻: %{customdata[4]:.2f} s<br>' +
+                      '加速度: %{customdata[0]:.2f} m/s²<br>' +
+                      '温度: %{customdata[1]:.1f} °C<br>' +
+                      '湿度: %{customdata[2]:.1f} %<br>' +
+                      '気圧: %{customdata[3]:.1f} hPa<br>' +
+                      'X: %{x:.2f} m<br>' +
+                      'Y: %{y:.2f} m<br>' +
+                      'Z: %{z:.2f} m<extra></extra>'
     )
     
     # 各フレームごとに現在位置と局所座標軸を表示するフレームを作成
@@ -200,6 +238,7 @@ def main():
         pitch = attitude[idx, 1]
         yaw = attitude[idx, 2]
         R_mat = euler_to_rotation_matrix(roll, pitch, yaw)
+        
         # 局所座標軸の終点を計算
         x_axis_end = pos_current + R_mat @ np.array([axis_length, 0, 0])
         y_axis_end = pos_current + R_mat @ np.array([0, axis_length, 0])
@@ -214,7 +253,8 @@ def main():
             marker=dict(size=5, color='red'),
             name='現在位置'
         )
-        # 局所X軸の表示
+        
+        # 局所座標軸の表示
         x_axis_trace = go.Scatter3d(
             x=[pos_current[0], x_axis_end[0]],
             y=[pos_current[1], x_axis_end[1]],
@@ -223,7 +263,6 @@ def main():
             line=dict(color='red', width=5),
             name='X軸'
         )
-        # 局所Y軸の表示
         y_axis_trace = go.Scatter3d(
             x=[pos_current[0], y_axis_end[0]],
             y=[pos_current[1], y_axis_end[1]],
@@ -232,7 +271,6 @@ def main():
             line=dict(color='green', width=5),
             name='Y軸'
         )
-        # 局所Z軸の表示
         z_axis_trace = go.Scatter3d(
             x=[pos_current[0], z_axis_end[0]],
             y=[pos_current[1], z_axis_end[1]],
@@ -241,7 +279,7 @@ def main():
             line=dict(color='orange', width=5),
             name='Z軸'
         )
-        # 各フレームのデータとして追加
+        
         frame_data = [flight_path_trace, current_pos_trace, x_axis_trace, y_axis_trace, z_axis_trace]
         frames.append(go.Frame(data=frame_data, name=f"frame{idx}"))
     
@@ -252,9 +290,11 @@ def main():
     pitch_init = attitude[init_idx, 1]
     yaw_init = attitude[init_idx, 2]
     R_init = euler_to_rotation_matrix(roll_init, pitch_init, yaw_init)
+    
     x_axis_end_init = pos_init + R_init @ np.array([axis_length, 0, 0])
     y_axis_end_init = pos_init + R_init @ np.array([0, axis_length, 0])
     z_axis_end_init = pos_init + R_init @ np.array([0, 0, axis_length])
+    
     current_pos_trace_init = go.Scatter3d(
         x=[pos_init[0]],
         y=[pos_init[1]],
@@ -298,7 +338,7 @@ def main():
             z_axis_trace_init
         ],
         layout=go.Layout(
-            title="加速度・ジャイロセンサーデータによる飛行ログ",
+            title="ロケット飛行ログ解析（改良版軌道計算）",
             scene=dict(
                 xaxis=dict(title='X (m)'),
                 yaxis=dict(title='Y (m)'),
@@ -329,7 +369,7 @@ def main():
                                      {"frame": {"duration": 50, "redraw": True},
                                       "mode": "immediate",
                                       "transition": {"duration": 0}}],
-                            "label": f"{time[idx]:.2f}",
+                            "label": f"{time[idx]:.2f}s",
                             "method": "animate"
                         }
                         for idx in indices
@@ -340,7 +380,7 @@ def main():
         frames=frames
     )
     
-    # 凡例の表示設定を改善（中央上部に配置し、フォントサイズや背景色、枠線を調整）
+    # 凡例の表示設定を改善
     fig.update_layout(
         legend=dict(
             title="凡例",
