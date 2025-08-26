@@ -213,19 +213,6 @@ class FlightAnalyzer:
             alt_baro = 44330 * (1 - (pressure / p0) ** (1/5.255))
             position[:, 2] = alt_baro - alt_baro[0]  # 高度（初期値をゼロに）
         
-        # 水平位置の制限（異常値を防ぐ - analyzer.pyの手法を参考）
-        max_altitude = np.max(position[:, 2])
-        horizontal_drift_limit = min(max_altitude * 0.5, 100.0)  # 高度の50%または100m以内
-        
-        # 水平位置を制限
-        position[:, 0] = np.clip(position[:, 0], -horizontal_drift_limit, horizontal_drift_limit)
-        position[:, 1] = np.clip(position[:, 1], -horizontal_drift_limit, horizontal_drift_limit)
-        
-        # 速度も制限（物理的に妥当な範囲）
-        max_horizontal_velocity = 100.0  # 100m/s以内
-        velocity[:, 0] = np.clip(velocity[:, 0], -max_horizontal_velocity, max_horizontal_velocity)
-        velocity[:, 1] = np.clip(velocity[:, 1], -max_horizontal_velocity, max_horizontal_velocity)
-        
         return {
             'time': time,
             'position': position,
@@ -236,7 +223,7 @@ class FlightAnalyzer:
         }
     
     def create_interactive_plot(self, save_html=True):
-        """インタラクティブな3Dプロット作成（analyzer.pyの手法を採用）"""
+        """インタラクティブな3Dプロット作成"""
         if self.processed_data is None:
             self.processed_data = self.calculate_trajectory()
         
@@ -246,121 +233,73 @@ class FlightAnalyzer:
         
         pos = self.processed_data['position']
         time = self.processed_data['time']
-        vel = self.processed_data['velocity']
         
         # 速度の大きさを計算
-        vel_magnitude = np.linalg.norm(vel, axis=1)
+        vel_magnitude = np.linalg.norm(self.processed_data['velocity'], axis=1)
         
-        # 加速度の大きさを計算
-        acc_magnitude = np.linalg.norm(self.processed_data['acceleration'], axis=1)
+        # メインの3D軌跡プロット
+        fig = make_subplots(
+            rows=2, cols=2,
+            specs=[[{"type": "scatter3d", "colspan": 2}, None],
+                   [{"type": "scatter"}, {"type": "scatter"}]],
+            subplot_titles=('飛行軌跡 3D', '高度変化', '速度変化'),
+            vertical_spacing=0.1
+        )
         
-        # 飛行サマリー計算
-        max_altitude = np.max(pos[:, 2])
-        max_velocity = np.max(vel_magnitude)
-        flight_time = time[-1] - time[0]
-        horizontal_distance = np.sqrt(pos[-1, 0]**2 + pos[-1, 1]**2)
-        max_acceleration = np.max(acc_magnitude)
-        
-        print("\n=== 飛行解析サマリー ===")
-        print(f"最大高度: {max_altitude:.2f} m")
-        print(f"最大速度: {max_velocity:.2f} m/s")
-        print(f"飛行時間: {flight_time:.2f} s")
-        print(f"水平移動距離: {horizontal_distance:.2f} m")
-        print(f"最大加速度: {max_acceleration:.2f} m/s²")
-        
-        # カスタムデータを準備（ホバー表示用）
-        if 'Temperature_C' in self.data.columns:
-            temperature_data = self.data['Temperature_C'].values
-        else:
-            temperature_data = np.full(len(time), 20.0)  # デフォルト値
-            
-        if 'Humidity_%' in self.data.columns:
-            humidity_data = self.data['Humidity_%'].values
-        else:
-            humidity_data = np.full(len(time), 50.0)  # デフォルト値
-            
-        if 'Pressure_hPa' in self.data.columns:
-            pressure_data = self.data['Pressure_hPa'].values
-        else:
-            pressure_data = np.full(len(time), 1013.25)  # デフォルト値
-        
-        custom_data = np.column_stack([
-            acc_magnitude,
-            temperature_data,
-            humidity_data,
-            pressure_data,
-            time,
-            vel_magnitude
-        ])
-        
-        # 3D軌跡トレースの作成（analyzer.pyの手法を採用）
-        flight_path_trace = go.Scatter3d(
-            x=pos[:, 0],
-            y=pos[:, 1],
-            z=pos[:, 2],
-            mode='lines+markers',
-            line=dict(
-                color=acc_magnitude,
-                colorscale='Plasma',  # より鮮やかなカラーマップ
-                width=6,
-                colorbar=dict(
-                    title=dict(text='加速度 (m/s²)', font=dict(size=14)),
-                    tickfont=dict(size=12)
-                )
+        # 3D軌跡
+        fig.add_trace(
+            go.Scatter3d(
+                x=pos[:, 0], y=pos[:, 1], z=pos[:, 2],
+                mode='lines+markers',
+                line=dict(color=vel_magnitude, colorscale='Plasma', width=4),
+                marker=dict(size=2, color=vel_magnitude, colorscale='Plasma'),
+                name='軌跡',
+                text=[f'時刻: {t:.2f}s<br>速度: {v:.2f}m/s' for t, v in zip(time, vel_magnitude)],
+                hovertemplate='X: %{x:.2f}m<br>Y: %{y:.2f}m<br>Z: %{z:.2f}m<br>%{text}<extra></extra>'
             ),
-            marker=dict(size=3, color=acc_magnitude, colorscale='Plasma'),
-            name='飛行軌跡',
-            customdata=custom_data,
-            hovertemplate='<b>飛行データ</b><br>' +
-                          '時刻: %{customdata[4]:.2f} s<br>' +
-                          '加速度: %{customdata[0]:.2f} m/s²<br>' +
-                          '速度: %{customdata[5]:.2f} m/s<br>' +
-                          '温度: %{customdata[1]:.1f} °C<br>' +
-                          '湿度: %{customdata[2]:.1f} %<br>' +
-                          '気圧: %{customdata[3]:.1f} hPa<br>' +
-                          'X: %{x:.2f} m<br>' +
-                          'Y: %{y:.2f} m<br>' +
-                          'Z: %{z:.2f} m<extra></extra>'
+            row=1, col=1
         )
         
-        # サマリー情報を注釈として追加
-        summary_text = (f"最大高度: {max_altitude:.2f} m<br>"
-                       f"最大速度: {max_velocity:.2f} m/s<br>"
-                       f"飛行時間: {flight_time:.2f} s<br>"
-                       f"水平距離: {horizontal_distance:.2f} m<br>"
-                       f"最大加速度: {max_acceleration:.2f} m/s²")
-        
-        # 単一の3Dプロットとして作成（analyzer.pyの手法）
-        fig = go.Figure(
-            data=[flight_path_trace],
-            layout=go.Layout(
-                title=dict(
-                    text="ロケット飛行軌跡解析（改良版）",
-                    font=dict(size=20)
-                ),
-                scene=dict(
-                    xaxis=dict(title='X (m)'),
-                    yaxis=dict(title='Y (m)'),
-                    zaxis=dict(title='Z (m)'),
-                    aspectmode='data'
-                ),
-                annotations=[
-                    dict(
-                        text=summary_text,
-                        showarrow=False,
-                        xref="paper", yref="paper",
-                        x=0.02, y=0.98,
-                        xanchor="left", yanchor="top",
-                        font=dict(size=12, color="black"),
-                        bgcolor="rgba(255,255,255,0.8)",
-                        bordercolor="black",
-                        borderwidth=1
-                    )
-                ],
-                width=1200,
-                height=800
-            )
+        # 高度変化
+        fig.add_trace(
+            go.Scatter(
+                x=time, y=pos[:, 2],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name='高度'
+            ),
+            row=2, col=1
         )
+        
+        # 速度変化
+        fig.add_trace(
+            go.Scatter(
+                x=time, y=vel_magnitude,
+                mode='lines',
+                line=dict(color='red', width=2),
+                name='速度'
+            ),
+            row=2, col=2
+        )
+        
+        # レイアウト設定
+        fig.update_layout(
+            title='ロケット飛行解析 - 詳細データ',
+            height=800,
+            showlegend=True
+        )
+        
+        fig.update_scenes(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='高度 (m)',
+            aspectmode='data'
+        )
+        
+        fig.update_xaxes(title_text='時間 (s)', row=2, col=1)
+        fig.update_yaxes(title_text='高度 (m)', row=2, col=1)
+        fig.update_xaxes(title_text='時間 (s)', row=2, col=2)
+        fig.update_yaxes(title_text='速度 (m/s)', row=2, col=2)
         
         if save_html:
             output_file = f'flight_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html'
