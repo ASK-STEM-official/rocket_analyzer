@@ -20,31 +20,32 @@ def euler_to_rotation_matrix(roll, pitch, yaw):
 
 # --- データ処理部 ---
 def process_sensor_data(df):
+    # --- 気圧から高度を計算（国際標準大気式） ---
+    P0 = 1013.25  # 海面気圧[hPa]
+    pressure = df['Pressure_hPa'].to_numpy()
+    alt_pressure = 44330 * (1 - (pressure / P0) ** (1/5.255))
     print(f"データ件数: {len(df)}")
-    print(f"初期加速度: {initial_acc}")
-    print(f"初期加速度ノルム: {initial_acc_norm}")
-    print(f"初期ロール: {initial_roll:.3f}, 初期ピッチ: {initial_pitch:.3f}, 初期ヨー: {initial_yaw:.3f}")
-    print(f"加速度バイアス: {bias}")
-    print(f"位置計算: 初期={position[0]}, 最終={position[-1]}")
-    print(f"位置範囲: X={position[:,0].min():.2f}～{position[:,0].max():.2f}, Y={position[:,1].min():.2f}～{position[:,1].max():.2f}, Z={position[:,2].min():.2f}～{position[:,2].max():.2f}")
-    required_columns = ['Time_s', 'AccelX_g', 'AccelY_g', 'AccelZ_g', 'GyroX_deg_s', 'GyroY_deg_s', 'GyroZ_deg_s', 'Temperature_C', 'Humidity_%', 'Pressure_hPa']
-    missing = [col for col in required_columns if col not in df.columns]
-    if missing:
-        print(f"警告: 以下のカラムが見つかりません: {missing}")
-        return None
-    time = df['Time_s'].values
-    dt = np.mean(np.diff(time))
     acc_columns = ['AccelX_g', 'AccelY_g', 'AccelZ_g']
     gyro_columns = ['GyroX_deg_s', 'GyroY_deg_s', 'GyroZ_deg_s']
     acc_data = df[acc_columns].to_numpy() * 9.81
     gyro_data = df[gyro_columns].to_numpy()
-    gyro_data_rad = np.deg2rad(gyro_data)
+    initial_samples = min(10, len(acc_data))
+    initial_acc = np.mean(acc_data[:initial_samples], axis=0)
+    initial_acc_norm = initial_acc / np.linalg.norm(initial_acc)
+    print(f"データ件数: {len(df)}")
+    acc_columns = ['AccelX_g', 'AccelY_g', 'AccelZ_g']
+    gyro_columns = ['GyroX_deg_s', 'GyroY_deg_s', 'GyroZ_deg_s']
+    time = df['Time_s'].values
+    dt = np.mean(np.diff(time))
+    acc_data = df[acc_columns].to_numpy() * 9.81
+    gyro_data = df[gyro_columns].to_numpy()
     initial_samples = min(10, len(acc_data))
     initial_acc = np.mean(acc_data[:initial_samples], axis=0)
     initial_acc_norm = initial_acc / np.linalg.norm(initial_acc)
     initial_roll = np.arctan2(initial_acc_norm[1], initial_acc_norm[2])
     initial_pitch = np.arctan2(-initial_acc_norm[0], np.sqrt(initial_acc_norm[1]**2 + initial_acc_norm[2]**2))
     initial_yaw = 0.0
+    gyro_data_rad = np.deg2rad(gyro_data)
     N = len(time)
     attitude = np.zeros((N, 3))
     attitude[0] = [initial_roll, initial_pitch, initial_yaw]
@@ -67,6 +68,34 @@ def process_sensor_data(df):
         R_mat = euler_to_rotation_matrix(roll, pitch, yaw)
         global_acc[i] = R_mat @ acc_data_filtered[i]
     global_acc[:, 2] = global_acc[:, 2] - 9.81
+    # --- バイアス算出区間を静止区間（FlightStarted==0）に限定 ---
+    if 'FlightStarted' in df.columns:
+        static_mask = df['FlightStarted'] == 0
+        if np.any(static_mask):
+            bias = np.mean(global_acc[static_mask], axis=0)
+        else:
+            bias = np.mean(global_acc[:20], axis=0)
+    else:
+        bias = np.mean(global_acc[:20], axis=0)
+    global_acc = global_acc - bias
+    if 'TotalAccel' in df.columns:
+        acc_magnitude = df['TotalAccel'].to_numpy() * 9.81
+    else:
+        acc_magnitude = np.linalg.norm(global_acc, axis=1)
+    velocity = cumulative_trapezoid(global_acc, dx=dt, initial=0, axis=0)
+    position = cumulative_trapezoid(velocity, dx=dt, initial=0, axis=0)
+    # --- Z軸はGPS高度(Alt_m)が使える場合はそちらを優先 ---
+    # --- Z軸は気圧高度のみを使用 ---
+    position[:,2] = alt_pressure
+    # --- まとめてログ出力 ---
+    print(f"初期加速度: {initial_acc}")
+    print(f"初期加速度ノルム: {initial_acc_norm}")
+    print(f"初期ロール: {initial_roll:.3f}, 初期ピッチ: {initial_pitch:.3f}, 初期ヨー: {initial_yaw:.3f}")
+    print(f"加速度バイアス: {bias}")
+    print(f"位置計算: 初期={position[0]}, 最終={position[-1]}")
+    print(f"位置範囲: X={position[:,0].min():.2f}～{position[:,0].max():.2f}, Y={position[:,1].min():.2f}～{position[:,1].max():.2f}, Z={position[:,2].min():.2f}～{position[:,2].max():.2f}")
+    # GPS高度は使わない
+    print(f"気圧高度: 初期={alt_pressure[0]:.2f}, 最終={alt_pressure[-1]:.2f}, 最大={alt_pressure.max():.2f}")
     static_samples = min(20, len(global_acc))
     bias = np.mean(global_acc[:static_samples], axis=0)
     global_acc = global_acc - bias
