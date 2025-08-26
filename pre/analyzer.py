@@ -4,6 +4,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.integrate import cumulative_trapezoid
 import os
+try:
+    from ahrs.filters.madgwick import Madgwick
+except ImportError:
+    raise ImportError("Madgwick filter requires 'ahrs' library. Install via 'pip install ahrs'.")
 
 # オイラー角（roll, pitch, yaw）から回転行列を計算する関数
 def euler_to_rotation_matrix(roll, pitch, yaw):
@@ -198,13 +202,19 @@ def process_sensor_data(df):
     active_mask = active_series.rolling(window=window_len, center=True, min_periods=1).mean() > 0.5
     active_mask = active_mask.to_numpy()
 
-    # データ駆動（短時間積分）による速度・位置推定（X/Y）
     vel = np.zeros((N, 2))
     pos_data = np.zeros((N, 2))
     # 積分（台形）で速度を求める
     vel[:, 0] = cumulative_trapezoid(global_acc[:, 0], time, initial=0)
     vel[:, 1] = cumulative_trapezoid(global_acc[:, 1], time, initial=0)
 
+    # ローパスフィルタ関数を再定義（速度ハイパス用）
+    def low_pass_filter(data, alpha=0.9):
+        filtered = np.zeros_like(data)
+        filtered[0] = data[0]
+        for i in range(1, len(data)):
+            filtered[i] = alpha * filtered[i-1] + (1 - alpha) * data[i]
+        return filtered
     # 静止区間では速度をゼロにする（バイアス補正のため）
     if 'FlightStarted' in df.columns:
         static_mask = df['FlightStarted'] == 0
@@ -266,7 +276,8 @@ def process_sensor_data(df):
         'temperature': df['Temperature_C'].to_numpy(),
         'humidity': df['Humidity_%'].to_numpy(),
         'pressure': df['Pressure_hPa'].to_numpy(),
-        'time': time
+        'time': time,
+        'attitude': attitude  # オイラー角を追加
     }
 
 # --- 表示部 ---
@@ -320,10 +331,94 @@ def plot_trajectory(data):
     fig.update_scenes(xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='高度 (m)')
     fig.update_xaxes(title_text='時間 (s)', row=2, col=1)
     fig.update_yaxes(title_text='高度 (m)', row=2, col=1)
+    # --- 3D軌跡アニメーション追加 ---
+    att = data.get('attitude')
+    if att is not None:
+        # フレーム設定
+        N = len(time)
+        max_frames = 100
+        step = max(1, N // max_frames)
+        indices = list(range(0, N, step))
+        if indices[-1] != N-1:
+            indices.append(N-1)
+        frames = []
+        axis_len = 5.0  # 姿勢軸を長くして見やすく
+        
+        # 初期姿勢軸も表示
+        init_i = indices[0]
+        p0 = pos[init_i]
+        r0, pr0, y0 = att[init_i]
+        Rm0 = euler_to_rotation_matrix(r0, pr0, y0)
+        x0_e = p0 + Rm0 @ np.array([axis_len,0,0])
+        y0_e = p0 + Rm0 @ np.array([0,axis_len,0])
+        z0_e = p0 + Rm0 @ np.array([0,0,axis_len])
+        
+        # 初期姿勢軸をfigに追加
+        fig.add_trace(go.Scatter3d(x=[p0[0]], y=[p0[1]], z=[p0[2]], mode='markers', 
+                                 marker=dict(size=8,color='red'), name='機体'), row=1, col=1)
+        fig.add_trace(go.Scatter3d(x=[p0[0],x0_e[0]], y=[p0[1],x0_e[1]], z=[p0[2],z0_e[2]], 
+                                 mode='lines', line=dict(color='red',width=6), name='X軸'), row=1, col=1)
+        fig.add_trace(go.Scatter3d(x=[p0[0],y0_e[0]], y=[p0[1],y0_e[1]], z=[p0[2],y0_e[2]], 
+                                 mode='lines', line=dict(color='green',width=6), name='Y軸'), row=1, col=1)
+        fig.add_trace(go.Scatter3d(x=[p0[0],z0_e[0]], y=[p0[1],z0_e[1]], z=[p0[2],z0_e[2]], 
+                                 mode='lines', line=dict(color='blue',width=6), name='Z軸'), row=1, col=1)
+        
+        for i in indices:
+            p = pos[i]
+            r, pr, y = att[i]
+            Rm = euler_to_rotation_matrix(r, pr, y)
+            x_e = p + Rm @ np.array([axis_len,0,0])
+            y_e = p + Rm @ np.array([0,axis_len,0])
+            z_e = p + Rm @ np.array([0,0,axis_len])
+            # 全てのトレースを含むフレームデータ
+            frame_data = [
+                flight_path,  # 軌跡
+                height_trace,  # 高度グラフ  
+                go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]], mode='markers', marker=dict(size=2,color='red'), name='機体'),
+                go.Scatter3d(x=[p[0],x_e[0]], y=[p[1],x_e[1]], z=[p[2],x_e[2]], mode='lines', line=dict(color='red',width=6), name='X軸'),
+                go.Scatter3d(x=[p[0],y_e[0]], y=[p[1],y_e[1]], z=[p[2],y_e[2]], mode='lines', line=dict(color='green',width=6), name='Y軸'),
+                go.Scatter3d(x=[p[0],z_e[0]], y=[p[1],z_e[1]], z=[p[2],z_e[2]], mode='lines', line=dict(color='blue',width=6), name='Z軸')
+            ]
+            frames.append(go.Frame(data=frame_data, name=f'frame{i}'))
+        
+        # フレームをFigureに設定
+        fig.frames = frames
+        
+        # 再生ボタンとスライダー設定を追加
+        fig.update_layout(
+            updatemenus=[{
+                'type': 'buttons',
+                'showactive': False,
+                'buttons': [{
+                    'label': '再生',
+                    'method': 'animate',
+                    'args': [None, {
+                        'frame': {'duration': 100, 'redraw': True},
+                        'fromcurrent': True,
+                        'transition': {'duration': 0}
+                    }]
+                }]
+            }],
+            sliders=[{
+                'active': 0,
+                'currentvalue': {'prefix': '時刻: '},
+                'pad': {'t': 50},
+                'steps': [{
+                    'args': [[f'frame{i}'], {
+                        'frame': {'duration': 100, 'redraw': True},
+                        'mode': 'immediate',
+                        'transition': {'duration': 0}
+                    }],
+                    'label': f"{time[i]:.2f}s",
+                    'method': 'animate'
+                } for i in indices]
+            }]
+        )
     # HTML出力
-    fig.write_html("output.html")
-    print("output.html をブラウザで開いてください")
-    input("Enterキーで終了します...")
+    fig.write_html("output_with_attitude.html")
+    print("output_with_attitude.html をブラウザで開いてください")
+    # 描画（無効化）
+    # fig.show()
 
 if __name__ == "__main__":
     df = pd.read_csv("sensor.csv")
