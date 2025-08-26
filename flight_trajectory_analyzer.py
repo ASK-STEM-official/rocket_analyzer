@@ -22,14 +22,12 @@ class FlightAnalyzer:
     def load_config(self):
         """設定を読み込み"""
         default_config = {
-            'filter_cutoff': 5.0,  # 加速度のカットオフ周波数
+            'filter_cutoff': 2.0,  # カットオフ周波数を上げる
             'gravity': 9.81,
             'reference_pressure': 1013.25,
             'temperature_lapse': -0.0065,
             'plot_style': 'viridis',
-            'animation_speed': 50,
-            'complementary_alpha': 0.96,  # 相補フィルタのパラメータ
-            'altitude_fusion_weight': 0.7  # 気圧高度の融合重み
+            'animation_speed': 50
         }
         
         config_path = 'analyzer_config.json'
@@ -88,69 +86,41 @@ class FlightAnalyzer:
         b, a = butter(order, normal_cutoff, btype='low', analog=False)
         return filtfilt(b, a, data)
     
-    def calculate_attitude_complementary(self, accel_data, gyro_data, dt):
-        """相補フィルタによる姿勢推定"""
+    def calculate_attitude(self, accel_data, gyro_data, dt):
+        """姿勢推定（相補フィルタ）"""
         N = len(accel_data)
         attitude = np.zeros((N, 3))  # roll, pitch, yaw
         
         # 初期姿勢を加速度から推定
-        initial_acc = np.mean(accel_data[:5], axis=0)  # 最初の5点の平均
+        initial_acc = np.mean(accel_data[:10], axis=0)
         initial_acc_norm = initial_acc / np.linalg.norm(initial_acc)
         
         attitude[0, 0] = np.arctan2(initial_acc_norm[1], initial_acc_norm[2])  # roll
         attitude[0, 1] = np.arctan2(-initial_acc_norm[0], 
                                   np.sqrt(initial_acc_norm[1]**2 + initial_acc_norm[2]**2))  # pitch
-        attitude[0, 2] = 0.0  # yaw（初期値）
+        attitude[0, 2] = 0.0  # yaw
         
-        # 相補フィルタのパラメータ
-        alpha = 0.96  # ジャイロの信頼度（高周波特性が良い）
-        beta = 1 - alpha  # 加速度の信頼度（低周波特性が良い）
+        alpha = 0.98  # 相補フィルタの係数
         
         for i in range(1, N):
-            # ジャイロによる予測（角速度積分）
+            # ジャイロ積分による姿勢予測
             gyro_rad = np.radians(gyro_data[i])
-            predicted = attitude[i-1] + gyro_rad * dt[i-1]
+            predicted = attitude[i-1] + gyro_rad * dt
             
-            # 加速度による修正（重力ベクトルから姿勢推定）
+            # 加速度による姿勢推定
             acc_norm = accel_data[i] / (np.linalg.norm(accel_data[i]) + 1e-8)
-            
-            # 加速度から roll, pitch を計算
             roll_acc = np.arctan2(acc_norm[1], acc_norm[2])
             pitch_acc = np.arctan2(-acc_norm[0], np.sqrt(acc_norm[1]**2 + acc_norm[2]**2))
             
             # 相補フィルタで融合
-            attitude[i, 0] = alpha * predicted[0] + beta * roll_acc
-            attitude[i, 1] = alpha * predicted[1] + beta * pitch_acc
-            attitude[i, 2] = predicted[2]  # yawはジャイロ積分のみ（磁力計がないため）
+            attitude[i, 0] = alpha * predicted[0] + (1 - alpha) * roll_acc
+            attitude[i, 1] = alpha * predicted[1] + (1 - alpha) * pitch_acc
+            attitude[i, 2] = predicted[2]  # yawは積分のみ
             
-            # 角度の正規化（-π to π）
-            for j in range(3):
-                while attitude[i, j] > np.pi:
-                    attitude[i, j] -= 2 * np.pi
-                while attitude[i, j] < -np.pi:
-                    attitude[i, j] += 2 * np.pi
-        
         return attitude
     
-    def rotation_matrix_from_euler(self, roll, pitch, yaw):
-        """オイラー角から回転行列を作成"""
-        # ZYX順の回転行列
-        R_x = np.array([[1, 0, 0],
-                       [0, np.cos(roll), -np.sin(roll)],
-                       [0, np.sin(roll), np.cos(roll)]])
-        
-        R_y = np.array([[np.cos(pitch), 0, np.sin(pitch)],
-                       [0, 1, 0],
-                       [-np.sin(pitch), 0, np.cos(pitch)]])
-        
-        R_z = np.array([[np.cos(yaw), -np.sin(yaw), 0],
-                       [np.sin(yaw), np.cos(yaw), 0],
-                       [0, 0, 1]])
-        
-        return R_z @ R_y @ R_x
-    
     def calculate_trajectory(self):
-        """改良された軌跡計算（ジャイロ+加速度融合）"""
+        """軌跡計算（簡易版）"""
         if self.data is None:
             return None
         
@@ -158,130 +128,66 @@ class FlightAnalyzer:
         time = self.data['Time_s'].values
         dt = np.diff(time)
         dt = np.append(dt, dt[-1])
-        fs = 1.0 / np.mean(dt)
         
         # センサーデータ取得
         accel_cols = ['AccelX_g', 'AccelY_g', 'AccelZ_g']
-        gyro_cols = ['GyroX_deg_s', 'GyroY_deg_s', 'GyroZ_deg_s']
-        
         accel_data = self.data[accel_cols].values * self.config['gravity']
-        gyro_data = self.data[gyro_cols].values
         
-        # センサーデータのフィルタリング
-        accel_filtered = np.zeros_like(accel_data)
-        gyro_filtered = np.zeros_like(gyro_data)
+        # 高度は気圧データを使用（これが最も信頼できる）
+        position = np.zeros((len(time), 3))
+        velocity = np.zeros((len(time), 3))
+        acceleration = accel_data.copy()
         
-        for i in range(3):
-            accel_filtered[:, i] = self.butter_lowpass_filter(
-                accel_data[:, i], self.config['filter_cutoff'], fs
-            )
-            gyro_filtered[:, i] = self.butter_lowpass_filter(
-                gyro_data[:, i], 1.0, fs  # ジャイロは少し高めのカットオフ
-            )
-        
-        # 静止状態の検出
-        static_samples = min(20, len(accel_data) // 10)
-        static_accel_mag = np.linalg.norm(accel_filtered[:static_samples], axis=1)
-        static_threshold = self.config['gravity'] * 1.2
-        static_indices = static_accel_mag < static_threshold
-        
-        # バイアス補正
-        if np.any(static_indices):
-            accel_bias = np.mean(accel_filtered[:static_samples][static_indices], axis=0)
-            gyro_bias = np.mean(gyro_filtered[:static_samples][static_indices], axis=0)
-            
-            # 重力方向の補正
-            gravity_vector = np.array([0, 0, self.config['gravity']])
-            accel_bias -= gravity_vector
-            
-            accel_filtered -= accel_bias
-            gyro_filtered -= gyro_bias
-        
-        # 相補フィルタによる姿勢推定
-        attitude = self.calculate_attitude_complementary(accel_filtered, gyro_filtered, dt)
-        
-        # 座標変換（ボディ座標 → グローバル座標）
-        # 水平方向のみ姿勢補正を適用、Z軸は後で気圧データで上書き
-        global_accel = np.zeros_like(accel_filtered)
-        
-        for i in range(len(accel_filtered)):
-            # 姿勢が安定している場合のみ座標変換を適用
-            attitude_magnitude = np.sqrt(attitude[i, 0]**2 + attitude[i, 1]**2)
-            if attitude_magnitude < np.radians(45):  # 45度以下の場合のみ変換
-                R = self.rotation_matrix_from_euler(attitude[i, 0], attitude[i, 1], attitude[i, 2])
-                global_accel[i] = R @ accel_filtered[i]
-            else:
-                # 姿勢が不安定な場合は変換なし
-                global_accel[i] = accel_filtered[i]
-        
-        # 重力補正（Z軸のみ）
-        global_accel[:, 2] -= self.config['gravity']
-        
-        # 適応的積分（水平方向のみ、高度は気圧データ使用）
-        velocity = np.zeros_like(global_accel)
-        position = np.zeros_like(global_accel)
-        
-        # X, Y軸の積分計算（水平方向）
-        for i in range(1, len(global_accel)):
-            # 水平方向の速度積分
-            velocity[i, 0] = velocity[i-1, 0] + 0.5 * (global_accel[i-1, 0] + global_accel[i, 0]) * dt[i-1]
-            velocity[i, 1] = velocity[i-1, 1] + 0.5 * (global_accel[i-1, 1] + global_accel[i, 1]) * dt[i-1]
-            
-            # 水平方向の位置積分
-            position[i, 0] = position[i-1, 0] + 0.5 * (velocity[i-1, 0] + velocity[i, 0]) * dt[i-1]
-            position[i, 1] = position[i-1, 1] + 0.5 * (velocity[i-1, 1] + velocity[i, 1]) * dt[i-1]
-        
-        # 気圧高度による Z軸（高度は気圧データを優先）
         if 'Pressure_hPa' in self.data.columns:
             pressure = self.data['Pressure_hPa'].values
-            p0 = pressure[0]
+            p0 = pressure[0]  # 基準気圧
             alt_baro = 44330 * (1 - (pressure / p0) ** (1/5.255))
+            position[:, 2] = alt_baro - alt_baro[0]  # 高度（初期値をゼロに）
             
-            # 気圧高度をそのまま使用（最も信頼できる）
-            position[:, 2] = alt_baro - alt_baro[0]  # 初期高度をゼロに正規化
-            
-            # 高度から速度を数値微分で計算
-            for i in range(1, len(velocity)):
+            # 高度から速度を計算（数値微分）
+            for i in range(1, len(position)):
                 velocity[i, 2] = (position[i, 2] - position[i-1, 2]) / dt[i-1]
         
-        # 水平方向（X, Y軸）のみセンサー融合を適用
-        # Z軸の加速度データは使わず、気圧高度のみを信頼
+        # 水平方向は保守的に計算（小さな移動のみ許可）
+        # 加速度データから推定するが、積分誤差を防ぐため制限を設ける
+        max_horizontal_vel = 50  # 最大水平速度 50m/s
+        max_horizontal_pos = 200  # 最大水平移動距離 200m
         
-        # ドリフト補正（水平方向のみ適用）
-        # 最後の20%のデータで着陸判定
-        landing_start = int(len(velocity) * 0.8)
-        if landing_start < len(velocity):
-            # 水平速度が小さい場合はドリフト補正
-            horizontal_vel_mag = np.sqrt(velocity[landing_start:, 0]**2 + velocity[landing_start:, 1]**2)
-            if np.mean(horizontal_vel_mag) < 5.0:  # 平均水平速度が5m/s以下の場合
-                # 水平方向の速度を徐々にゼロに収束
-                for i in range(landing_start, len(velocity)):
-                    decay_factor = 1.0 - 0.5 * (i - landing_start) / (len(velocity) - landing_start)
-                    velocity[i, 0] *= decay_factor  # X方向
-                    velocity[i, 1] *= decay_factor  # Y方向
-                    # Z方向（高度方向）はそのまま（気圧データを信頼）
-                
-                # 水平位置も再計算
-                for i in range(landing_start + 1, len(position)):
-                    position[i, 0] = position[i-1, 0] + 0.5 * (velocity[i-1, 0] + velocity[i, 0]) * dt[i-1]
-                    position[i, 1] = position[i-1, 1] + 0.5 * (velocity[i-1, 1] + velocity[i, 1]) * dt[i-1]
-                    # Z方向は気圧データのまま変更しない
+        # X, Y軸の簡易計算
+        for axis in range(2):  # X, Y軸
+            # 重力補正された加速度（Z軸のみ重力を引く）
+            if axis == 2:
+                acc_corrected = acceleration[:, axis] - self.config['gravity']
+            else:
+                acc_corrected = acceleration[:, axis]
+            
+            # 速度積分（簡易版）
+            for i in range(1, len(velocity)):
+                velocity[i, axis] = velocity[i-1, axis] + acc_corrected[i] * dt[i-1]
+                # 速度制限
+                velocity[i, axis] = np.clip(velocity[i, axis], -max_horizontal_vel, max_horizontal_vel)
+            
+            # 位置積分（Z軸は既に気圧データで計算済み）
+            if axis < 2:
+                for i in range(1, len(position)):
+                    position[i, axis] = position[i-1, axis] + velocity[i, axis] * dt[i-1]
+                    # 位置制限
+                    position[i, axis] = np.clip(position[i, axis], -max_horizontal_pos, max_horizontal_pos)
         
-        # 異常値の制限（水平方向のみ）
-        max_velocity = 100  # 最大速度 100m/s（現実的な値）
-        max_horizontal_distance = 300  # 最大水平距離 300m
-        
-        # X, Y軸のみ制限（Z軸は気圧データを信頼）
-        velocity[:, 0] = np.clip(velocity[:, 0], -max_velocity, max_velocity)
-        velocity[:, 1] = np.clip(velocity[:, 1], -max_velocity, max_velocity)
-        position[:, 0] = np.clip(position[:, 0], -max_horizontal_distance, max_horizontal_distance)
-        position[:, 1] = np.clip(position[:, 1], -max_horizontal_distance, max_horizontal_distance)
+        # 簡易姿勢推定（加速度ベース）
+        attitude = np.zeros((len(time), 3))
+        for i in range(len(time)):
+            acc_norm = acceleration[i] / (np.linalg.norm(acceleration[i]) + 1e-8)
+            attitude[i, 0] = np.arctan2(acc_norm[1], acc_norm[2])  # roll
+            attitude[i, 1] = np.arctan2(-acc_norm[0], np.sqrt(acc_norm[1]**2 + acc_norm[2]**2))  # pitch
+            # yawは0に固定（計算が不安定なため）
+            attitude[i, 2] = 0
         
         return {
             'time': time,
             'position': position,
             'velocity': velocity,
-            'acceleration': global_accel,
+            'acceleration': acceleration,
             'attitude': attitude,
             'pressure_altitude': position[:, 2] if 'Pressure_hPa' in self.data.columns else None
         }
