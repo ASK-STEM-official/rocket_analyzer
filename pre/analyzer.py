@@ -1,7 +1,7 @@
-
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from scipy.integrate import cumulative_trapezoid
 import os
 
@@ -271,54 +271,56 @@ def process_sensor_data(df):
 
 # --- 表示部 ---
 def plot_trajectory(data):
+    # 3D軌跡と高度変化グラフを作成
     if data is None:
         print("データ処理に失敗しました")
         return
+    pos = data['position']
+    time = data['time']
+    acc_magnitude = data['acc_magnitude']
+    # カスタムデータ準備
     custom_data = np.column_stack([
-        data['acc_magnitude'],
+        acc_magnitude,
         data['temperature'],
         data['humidity'],
         data['pressure'],
-        data['time']
+        time
     ])
-    flight_path_trace = go.Scatter3d(
-        x=data['position'][:, 0],
-        y=data['position'][:, 1],
-        z=data['position'][:, 2],
+    # サブプロット設定
+    fig = make_subplots(
+        rows=2, cols=1,
+        specs=[[{"type": "scatter3d"}],
+               [{"type": "scatter"}]],
+        subplot_titles=('飛行軌跡 3D', '高度変化'),
+        vertical_spacing=0.1,
+        row_heights=[0.7, 0.3]
+    )
+    # 3D軌跡トレース
+    flight_path = go.Scatter3d(
+        x=pos[:, 0], y=pos[:, 1], z=pos[:, 2],
         mode='lines',
-        line=dict(
-            color=data['acc_magnitude'],
-            colorscale='Viridis',
-            width=5,
-            colorbar=dict(
-                title=dict(text='加速度 (m/s^2)'),
-                tickfont=dict(size=10)
-            )
-        ),
-        name='飛行軌跡',
+        line=dict(color=acc_magnitude, colorscale='Viridis', width=5,
+                  colorbar=dict(title=dict(text='加速度 (m/s^2)'))),
         customdata=custom_data,
-        hovertemplate='<b>飛行データ</b><br>' +
-                      '時刻: %{customdata[4]:.2f} s<br>' +
-                      '加速度: %{customdata[0]:.2f} m/s²<br>' +
-                      '温度: %{customdata[1]:.1f} °C<br>' +
-                      '湿度: %{customdata[2]:.1f} %<br>' +
-                      '気圧: %{customdata[3]:.1f} hPa<br>' +
-                      'X: %{x:.2f} m<br>' +
-                      'Y: %{y:.2f} m<br>' +
-                      'Z: %{z:.2f} m<extra></extra>'
+        hovertemplate='時刻:%{customdata[4]:.2f}s<br>' +
+                     '加速度:%{customdata[0]:.2f}m/s²<br>' +
+                     '温度:%{customdata[1]:.1f}°C<br>' +
+                     '湿度:%{customdata[2]:.1f}%<br>' +
+                     '気圧:%{customdata[3]:.1f}hPa<extra></extra>'
     )
-    fig = go.Figure(
-        data=[flight_path_trace],
-        layout=go.Layout(
-            title="ロケット飛行ログ解析（静的軌道プロット）",
-            scene=dict(
-                xaxis=dict(title='X (m)'),
-                yaxis=dict(title='Y (m)'),
-                zaxis=dict(title='Z (m)'),
-                aspectmode='data'
-            )
-        )
+    fig.add_trace(flight_path, row=1, col=1)
+    # 高度変化トレース
+    height_trace = go.Scatter(
+        x=time, y=pos[:, 2], mode='lines',
+        line=dict(color='blue', width=2), name='高度'
     )
+    fig.add_trace(height_trace, row=2, col=1)
+    # レイアウト調整
+    fig.update_layout(title='ロケット飛行ログ解析', height=800)
+    fig.update_scenes(xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='高度 (m)')
+    fig.update_xaxes(title_text='時間 (s)', row=2, col=1)
+    fig.update_yaxes(title_text='高度 (m)', row=2, col=1)
+    # HTML出力
     fig.write_html("output.html")
     print("output.html をブラウザで開いてください")
     input("Enterキーで終了します...")
