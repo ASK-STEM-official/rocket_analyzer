@@ -25,7 +25,7 @@ def euler_to_rotation_matrix(roll, pitch, yaw):
 # メインの処理を行う関数
 def main():
     # CSVファイルからセンサーデータを読み込む
-    df = pd.read_csv("before_flight2.csv")
+    df = pd.read_csv("sensor.csv")
 
     # 'Time_s' カラムが存在すればその値を使用、なければ dt=0.01 秒でタイムスタンプを生成
     if 'Time_s' in df.columns:
@@ -49,52 +49,24 @@ def main():
         raise ValueError(f"必要なカラムが見つかりません: {missing_columns}")
     
     # 加速度データを取得し、単位を g から m/s^2 に変換
-    acc_data = data[acc_columns].to_numpy() * 9.81
-    # 加速度データの異常値処理（±50gを超える値をクリップ）
-    acc_data = np.clip(acc_data, -50*9.81, 50*9.81)
-    
+    acc_data = df[acc_columns].to_numpy() * 9.81  
     # ジャイロデータ（単位: deg/s）を取得
-    gyro_data = data[gyro_columns].to_numpy()   
-    
-    # ジャイロデータの異常値処理（±250度/秒を超える値をクリップ）
-    gyro_data = np.clip(gyro_data, -200, 200)
-    
-    # センサーバイアス（オフセット）を除去（静止時の平均値を引く）
-    # 最初の10データポイントを静止状態と仮定
-    acc_bias = np.mean(acc_data[:10], axis=0)
-    acc_bias[2] -= 9.81  # Z軸は重力を考慮
-    acc_data = acc_data - acc_bias
-    
-    gyro_bias = np.mean(gyro_data[:10], axis=0)
-    gyro_data = gyro_data - gyro_bias
-    
-    # 簡易ローパスフィルター（移動平均）でノイズを軽減
-    window_size = 3
-    for i in range(3):
-        acc_data[:, i] = np.convolve(acc_data[:, i], np.ones(window_size)/window_size, mode='same')
-        gyro_data[:, i] = np.convolve(gyro_data[:, i], np.ones(window_size)/window_size, mode='same')
-    
-    # データの品質チェック（デバッグ情報）
-    print(f"データ点数: {len(time)}")
-    print(f"時間範囲: {time[0]:.3f} - {time[-1]:.3f} 秒")
-    print(f"平均時間間隔: {np.mean(np.diff(time)):.4f} 秒")
-    print(f"加速度バイアス: X:{acc_bias[0]:.2f}, Y:{acc_bias[1]:.2f}, Z:{acc_bias[2]:.2f} m/s^2")
-    print(f"ジャイロバイアス: X:{gyro_bias[0]:.1f}, Y:{gyro_bias[1]:.1f}, Z:{gyro_bias[2]:.1f} deg/s")
-    print(f"加速度範囲: X[{acc_data[:,0].min():.2f}, {acc_data[:,0].max():.2f}] Y[{acc_data[:,1].min():.2f}, {acc_data[:,1].max():.2f}] Z[{acc_data[:,2].min():.2f}, {acc_data[:,2].max():.2f}] m/s^2")
-    print(f"ジャイロ範囲: X[{gyro_data[:,0].min():.1f}, {gyro_data[:,0].max():.1f}] Y[{gyro_data[:,1].min():.1f}, {gyro_data[:,1].max():.1f}] Z[{gyro_data[:,2].min():.1f}, {gyro_data[:,2].max():.1f}] deg/s")
+    gyro_data = df[gyro_columns].to_numpy()   
     
     # ジャイロデータをラジアンに変換
     gyro_data_rad = np.deg2rad(gyro_data)
     
-    # 実際の時間差分を計算（不均一な時間間隔に対応）
-    dt_array = np.diff(time)
-    dt_array = np.append(dt_array, dt_array[-1])  # 最後の要素用
+    # 初期姿勢推定（最初の数秒の加速度から推定）
+    initial_samples = min(10, len(acc_data))
+    initial_acc = np.mean(acc_data[:initial_samples], axis=0)
+    initial_acc_norm = initial_acc / np.linalg.norm(initial_acc)
     
-    # 各時刻でのオイラー角を積分により計算（簡易版、実際の時間差を使用）
-    attitude = np.zeros_like(gyro_data_rad)
-    for i in range(1, len(attitude)):
-        attitude[i] = attitude[i-1] + gyro_data_rad[i] * dt_array[i-1]
+    # 初期のロール・ピッチを推定
+    initial_roll = np.arctan2(initial_acc_norm[1], initial_acc_norm[2])
+    initial_pitch = np.arctan2(-initial_acc_norm[0], np.sqrt(initial_acc_norm[1]**2 + initial_acc_norm[2]**2))
+    initial_yaw = 0.0  # 初期ヨー角は0と仮定
     
+    # 姿勢角の計算（改良版）
     N = len(time)
     attitude = np.zeros((N, 3))
     attitude[0] = [initial_roll, initial_pitch, initial_yaw]
@@ -124,15 +96,10 @@ def main():
         pitch = attitude[i, 1]
         yaw = attitude[i, 2]
         R_mat = euler_to_rotation_matrix(roll, pitch, yaw)
-        global_acc[i] = R_mat @ acc_data[i]
+        global_acc[i] = R_mat @ acc_data_filtered[i]
     
-    # 重力加速度を正しく除去（グローバル座標系でZ軸負方向に9.81）
-    gravity_vector = np.array([0, 0, 9.81])  # グローバル座標系での重力
-    global_acc = global_acc - gravity_vector
-    
-    # 小さな加速度を無視（ノイズ除去）
-    threshold = 1.0  # 1.0 m/s^2以下の加速度を0にする（より積極的）
-    global_acc[np.abs(global_acc) < threshold] = 0
+    # 重力加速度を除去（Z軸方向）
+    global_acc[:, 2] = global_acc[:, 2] - 9.81
     
     # 静止時の加速度バイアスを除去
     static_samples = min(20, len(global_acc))
@@ -145,45 +112,9 @@ def main():
     else:
         acc_magnitude = np.linalg.norm(global_acc, axis=1)
     
-    # 実際の時間差を使って加速度の積分により速度、さらに速度の積分により位置を計算
-    velocity = np.zeros_like(global_acc)
-    position = np.zeros_like(global_acc)
-    
-    for i in range(1, N):
-        # 台形公式で積分
-        velocity[i] = velocity[i-1] + (global_acc[i-1] + global_acc[i]) * dt_array[i-1] / 2
-        position[i] = position[i-1] + (velocity[i-1] + velocity[i]) * dt_array[i-1] / 2
-    
-    # 速度ドリフト補正（最終的に停止すると仮定）
-    final_velocity_drift = velocity[-1] / len(velocity)
-    for i in range(len(velocity)):
-        velocity[i] = velocity[i] - final_velocity_drift * i
-    
-    # 位置を再計算（ドリフト補正後の速度を使用）
-    position = np.zeros_like(global_acc)
-    for i in range(1, N):
-        position[i] = position[i-1] + (velocity[i-1] + velocity[i]) * dt_array[i-1] / 2
-    
-    # 座標軸の修正: Y→Z（高度）, Z→Y（前後方向）
-    # position[:, [0,1,2]] を position[:, [0,2,1]] に変換
-    position_corrected = position[:, [0, 2, 1]]  # X, Z→Y, Y→Z
-    velocity_corrected = velocity[:, [0, 2, 1]]
-    
-    # 最終的な飛行距離の情報（修正後の座標系）
-    final_position = position_corrected[-1]
-    max_altitude = np.max(position_corrected[:, 2])  # Z軸が高度
-    flight_distance_2d = np.sqrt(final_position[0]**2 + final_position[1]**2)
-    
-    print(f"\n=== 飛行結果（座標軸修正後） ===")
-    print(f"最終位置: X={final_position[0]:.2f}m, Y={final_position[1]:.2f}m, Z={final_position[2]:.2f}m")
-    print(f"最大高度: {max_altitude:.2f}m")
-    print(f"水平飛行距離: {flight_distance_2d:.2f}m")
-    print(f"最大速度: {np.max(np.linalg.norm(velocity_corrected, axis=1)):.2f}m/s")
-    print(f"最大加速度: {np.max(acc_magnitude):.2f}m/s^2")
-    
-    # 以降のプロット用に修正後の座標を使用
-    position = position_corrected
-    velocity = velocity_corrected
+    # 加速度の積分により速度、さらに速度の積分により位置を計算（台形公式）
+    velocity = cumulative_trapezoid(global_acc, dx=dt, initial=0, axis=0)
+    position = cumulative_trapezoid(velocity, dx=dt, initial=0, axis=0)
     
     # アニメーションで使用するフレーム数の上限を設定
     max_frames = 100
