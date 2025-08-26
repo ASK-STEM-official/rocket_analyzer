@@ -1,0 +1,10 @@
+{
+  "filter_cutoff": 0.6302325581395348,
+  "gravity": 9.81,
+  "reference_pressure": 1013.25,
+  "temperature_lapse": -0.0065,
+  "plot_style": "viridis",
+  "animation_speed": 50,
+  "complementary_alpha": 0.96,
+  "altitude_fusion_weight": 0.7
+}
