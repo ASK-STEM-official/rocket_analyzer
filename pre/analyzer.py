@@ -86,34 +86,28 @@ def process_sensor_data(df):
         acc_magnitude = np.linalg.norm(global_acc, axis=1)
     velocity = cumulative_trapezoid(global_acc, dx=dt, initial=0, axis=0)
     position = cumulative_trapezoid(velocity, dx=dt, initial=0, axis=0)
-    # --- Z軸はGPS高度(Alt_m)が使える場合はそちらを優先 ---
-    # --- Z軸は気圧高度のみを使用 ---
+    # Z軸は気圧高度を使用
     position[:,2] = alt_pressure
-    # --- まとめてログ出力 ---
+    
+    # ログ出力
     print(f"初期加速度: {initial_acc}")
     print(f"初期加速度ノルム: {initial_acc_norm}")
     print(f"初期ロール: {initial_roll:.3f}, 初期ピッチ: {initial_pitch:.3f}, 初期ヨー: {initial_yaw:.3f}")
     print(f"加速度バイアス: {bias}")
     print(f"位置計算: 初期={position[0]}, 最終={position[-1]}")
     print(f"位置範囲: X={position[:,0].min():.2f}～{position[:,0].max():.2f}, Y={position[:,1].min():.2f}～{position[:,1].max():.2f}, Z={position[:,2].min():.2f}～{position[:,2].max():.2f}")
-    # GPS高度は使わない
     print(f"気圧高度: 初期={alt_pressure[0]:.2f}, 最終={alt_pressure[-1]:.2f}, 最大={alt_pressure.max():.2f}")
-    static_samples = min(20, len(global_acc))
-    bias = np.mean(global_acc[:static_samples], axis=0)
-    global_acc = global_acc - bias
-    if 'TotalAccel' in df.columns:
-        acc_magnitude = df['TotalAccel'].to_numpy() * 9.81
-    else:
-        acc_magnitude = np.linalg.norm(global_acc, axis=1)
-    velocity = cumulative_trapezoid(global_acc, dx=dt, initial=0, axis=0)
-    position = cumulative_trapezoid(velocity, dx=dt, initial=0, axis=0)
+    
     return {
         'position': position,
+        'velocity': velocity,
+        'acceleration': global_acc,
         'acc_magnitude': acc_magnitude,
         'temperature': df['Temperature_C'].to_numpy(),
         'humidity': df['Humidity_%'].to_numpy(),
         'pressure': df['Pressure_hPa'].to_numpy(),
-        'time': time
+        'time': time,
+        'attitude': attitude
     }
 
 # --- 表示部 ---
@@ -195,9 +189,9 @@ def plot_trajectory(data):
                 font=dict(size=20)
             ),
             scene=dict(
-                xaxis=dict(title='X (m)', titlefont=dict(size=14)),
-                yaxis=dict(title='Y (m)', titlefont=dict(size=14)),
-                zaxis=dict(title='Z (m)', titlefont=dict(size=14)),
+                xaxis=dict(title='X (m)'),
+                yaxis=dict(title='Y (m)'),
+                zaxis=dict(title='Z (m)'),
                 aspectmode='data'
             ),
             annotations=[
@@ -230,6 +224,6 @@ def plot_trajectory(data):
     return fig
 
 if __name__ == "__main__":
-    df = pd.read_csv("../sensor_data50.csv")  # 正しいファイルパスに修正
+    df = pd.read_csv("../sensor.csv")  # sensor.csvを使用
     data = process_sensor_data(df)
     plot_trajectory(data)
