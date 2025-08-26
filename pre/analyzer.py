@@ -421,6 +421,6 @@ def plot_trajectory(data):
     # fig.show()
 
 if __name__ == "__main__":
-    df = pd.read_csv("sensor.csv")
+    df = pd.read_csv("sensor_data50.csv")
     data = process_sensor_data(df)
     plot_trajectory(data)
